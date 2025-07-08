@@ -134,7 +134,7 @@ void MainWindow::runFusion()
         irCV.emplace_back(static_cast<float>(pt.x()), static_cast<float>(pt.y()));
 
     try {
-        imgRes = ImageFusion::fuseImagesEPTDAC(imgTV, imgIR, tvCV, irCV);
+        imgRes = ImageFusion::fuseImagesEPTDAC_RGB(imgTV, imgIR, tvCV, irCV);
     } catch (const cv::Exception& e) {
         QMessageBox::warning(this, "Fusion Error", e.what());
         return;
