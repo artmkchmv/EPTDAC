@@ -11,6 +11,8 @@
 #include <opencv2/cudafilters.hpp>
 
 const double ALPHA = 2;
+const double UP_THRESHOLD = 165;
+const double DOWN_THRESHOLD = 30;
 
 cv::Mat ImageFusion::fuseImagesEPTDAC(cv::Mat& TV_CPU_8U, cv::Mat& IR_CPU_8U,
                                      const std::vector<cv::Point2f>& tvPoints,
@@ -91,6 +93,125 @@ cv::Mat ImageFusion::fuseImagesEPTDAC(cv::Mat& TV_CPU_8U, cv::Mat& IR_CPU_8U,
     result_CPU.convertTo(result_CPU, CV_8U);
 
     return result_CPU;
+}
+
+double adaptiveThreshold(const cv::Mat& tv)
+{
+    cv::Scalar meanBGR = cv::mean(tv);
+    double brightness = 0.114 * meanBGR[0] + 0.587 * meanBGR[1] + 0.299 * meanBGR[2];
+    return (brightness > 100) ? UP_THRESHOLD : DOWN_THRESHOLD;
+}
+
+cv::Mat ImageFusion::fuseImagesEPTDAC_RGB(cv::Mat& TV_CPU_8U, cv::Mat& IR_CPU_8U,
+                                      const std::vector<cv::Point2f>& tvPoints,
+                                      const std::vector<cv::Point2f>& irPoints)
+{
+    if (IR_CPU_8U.size() != TV_CPU_8U.size()) {
+        cv::resize(IR_CPU_8U, IR_CPU_8U, TV_CPU_8U.size(), 0, 0, cv::INTER_LINEAR);
+    }
+
+    if (!irPoints.empty() && irPoints.size() == tvPoints.size()) {
+        cv::Mat H = cv::findHomography(irPoints, tvPoints);
+        cv::Mat IR_aligned;
+        cv::warpPerspective(IR_CPU_8U, IR_aligned, H, TV_CPU_8U.size());
+        IR_CPU_8U = IR_aligned;
+    }
+
+    cv::Mat TV_Color_BGR;
+    if (TV_CPU_8U.channels() == 3)
+        TV_Color_BGR = TV_CPU_8U.clone();
+    else
+        cv::cvtColor(TV_CPU_8U, TV_Color_BGR, cv::COLOR_GRAY2BGR);
+
+    if (TV_CPU_8U.channels() == 3)
+        cv::cvtColor(TV_CPU_8U, TV_CPU_8U, cv::COLOR_BGR2GRAY);
+    if (IR_CPU_8U.channels() == 3)
+        cv::cvtColor(IR_CPU_8U, IR_CPU_8U, cv::COLOR_BGR2GRAY);
+
+    cv::Scalar M_IR_CPU, D_IR_CPU;
+    cv::meanStdDev(IR_CPU_8U, M_IR_CPU, D_IR_CPU);
+
+    cv::cuda::GpuMat IR_GPU_8U, E_IR_GPU_8U, E_IR_GPU_32F;
+    IR_GPU_8U.upload(IR_CPU_8U);
+    cv::cuda::subtract(IR_GPU_8U, M_IR_CPU[0], E_IR_GPU_8U);
+    cv::cuda::divide(E_IR_GPU_8U, D_IR_CPU[0], E_IR_GPU_8U);
+
+    cv::cuda::GpuMat TV_GPU_8U, TV_GPU_32F;
+    TV_GPU_8U.upload(TV_CPU_8U);
+    TV_GPU_8U.convertTo(TV_GPU_32F, CV_32F);
+
+    auto sobelX = cv::cuda::createSobelFilter(CV_32F, CV_32F, 1, 0, 3);
+    auto sobelY = cv::cuda::createSobelFilter(CV_32F, CV_32F, 0, 1, 3);
+
+    cv::cuda::GpuMat gradX, gradY;
+    sobelX->apply(TV_GPU_32F, gradX);
+    sobelY->apply(TV_GPU_32F, gradY);
+
+    cv::cuda::GpuMat gradX2, gradY2, gradSum, E_TV_GPU_32F;
+    cv::cuda::multiply(gradX, gradX, gradX2);
+    cv::cuda::multiply(gradY, gradY, gradY2);
+    cv::cuda::add(gradX2, gradY2, gradSum);
+    cv::cuda::sqrt(gradSum, E_TV_GPU_32F);
+
+    E_IR_GPU_8U.convertTo(E_IR_GPU_32F, CV_32F);
+
+    cv::cuda::normalize(E_TV_GPU_32F, E_TV_GPU_32F, 0.0, 1.0, cv::NORM_MINMAX, CV_32F);
+    cv::cuda::normalize(E_IR_GPU_32F, E_IR_GPU_32F, 0.0, 1.0, cv::NORM_MINMAX, CV_32F);
+
+    cv::cuda::GpuMat diff_E_GPU;
+    cv::cuda::subtract(E_TV_GPU_32F, E_IR_GPU_32F, diff_E_GPU);
+
+    cv::cuda::GpuMat weight_TV_GPU, weight_IR_GPU, sigmoid_GPU;
+    cv::cuda::multiply(diff_E_GPU, ALPHA, sigmoid_GPU);
+
+    cv::cuda::GpuMat exp_GPU, neg_sigmoid_GPU;
+    cv::cuda::subtract(0.0, sigmoid_GPU, neg_sigmoid_GPU);
+    cv::cuda::exp(neg_sigmoid_GPU, exp_GPU);
+    cv::cuda::add(exp_GPU, 1.0, exp_GPU);
+    cv::cuda::divide(1.0, exp_GPU, weight_TV_GPU);
+    cv::cuda::subtract(1.0, weight_TV_GPU, weight_IR_GPU);
+
+    cv::cuda::GpuMat weight_TV_blur_GPU, weight_IR_blur_GPU;
+    auto gauss = cv::cuda::createGaussianFilter(CV_32F, CV_32F, cv::Size(9, 9), 3);
+    gauss->apply(weight_TV_GPU, weight_TV_blur_GPU);
+    gauss->apply(weight_IR_GPU, weight_IR_blur_GPU);
+
+    cv::cuda::GpuMat IR_GPU_32F;
+    IR_GPU_8U.convertTo(IR_GPU_32F, CV_32F);
+
+    cv::cuda::GpuMat fused_TV_GPU, fused_IR_GPU, result_GPU;
+    cv::cuda::multiply(weight_TV_blur_GPU, TV_GPU_32F, fused_TV_GPU);
+    cv::cuda::multiply(weight_IR_blur_GPU, IR_GPU_32F, fused_IR_GPU);
+    cv::cuda::add(fused_TV_GPU, fused_IR_GPU, result_GPU);
+
+    cv::cuda::GpuMat resultNorm_GPU;
+    cv::cuda::normalize(result_GPU, resultNorm_GPU, 0, 255, cv::NORM_MINMAX, CV_32F);
+    resultNorm_GPU.convertTo(resultNorm_GPU, CV_8U);
+
+    cv::cuda::GpuMat TV_Color_BGR_GPU, TV_HSV_GPU;
+    TV_Color_BGR_GPU.upload(TV_Color_BGR);
+    cv::cuda::cvtColor(TV_Color_BGR_GPU, TV_HSV_GPU, cv::COLOR_BGR2HSV);
+
+    std::vector<cv::cuda::GpuMat> hsvChannels(3);
+    cv::cuda::split(TV_HSV_GPU, hsvChannels);
+
+    cv::cuda::GpuMat resizedResult_GPU;
+    resizedResult_GPU = resultNorm_GPU;
+    resizedResult_GPU.copyTo(hsvChannels[2]);
+
+    cv::Mat irMask_CPU;
+    cv::threshold(IR_CPU_8U, irMask_CPU, adaptiveThreshold(TV_Color_BGR), 255, cv::THRESH_BINARY);
+    cv::cuda::GpuMat irMask_GPU;
+    irMask_GPU.upload(irMask_CPU);
+
+    hsvChannels[1].setTo(cv::Scalar(0), irMask_GPU);
+
+    cv::cuda::merge(hsvChannels, TV_HSV_GPU);
+    cv::cuda::cvtColor(TV_HSV_GPU, TV_Color_BGR_GPU, cv::COLOR_HSV2BGR);
+
+    cv::Mat resultColor;
+    TV_Color_BGR_GPU.download(resultColor);
+    return resultColor;
 }
 
 cv::Mat ImageFusion::fuseImagesHalf(cv::Mat& TV_CPU_8U, cv::Mat& IR_CPU_8U) {
